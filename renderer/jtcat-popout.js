@@ -2092,7 +2092,7 @@ function _applyPopoutTheme(payload) {
         src.connect(analyser);
       }
 
-      multiWfPanes.push({ sliceId: cfg.sliceId, canvas: canvas, ctx: canvas.getContext('2d'), analyser: analyser, sampleRate: entry ? entry.ctx.sampleRate : 48000, txLine: txLine, txHz: txHz });
+      multiWfPanes.push({ sliceId: cfg.sliceId, canvas: canvas, ctx: canvas.getContext('2d'), analyser: analyser, sampleRate: entry ? entry.ctx.sampleRate : 48000, txLine: txLine, txHz: txHz, noiseFloor: null });
     });
 
     // Start waterfall animation loop
@@ -2110,15 +2110,25 @@ function _applyPopoutTheme(payload) {
         // AudioContext sample rate is typically 48kHz, so 3kHz = bins * (3000 / (sampleRate/2))
         var nyquist = (p.sampleRate || 48000) / 2;
         var useBins = Math.max(1, Math.floor(bins.length * 3000 / nyquist));
+        // Adaptive noise-floor coloring — same fix as popoutWaterfallLoop
+        // (see wfUpdateNoiseFloor/wfColorForNorm above) and ft8RenderWaterfall
+        // in renderer/remote.js, ported a third time here. Each pane tracks
+        // its own floor (p.noiseFloor) rather than sharing the single-pane
+        // wfNoiseFloor — different slices can sit on different bands with
+        // very different real noise levels.
+        var lineVals = new Float32Array(w);
+        for (var x = 0; x < w; x++) lineVals[x] = bins[Math.floor(x * useBins / w)];
+        var sorted = Array.prototype.slice.call(lineVals).sort(function (a, b) { return a - b; });
+        var rawFloor = sorted[Math.floor(w * WF_AUTO_FLOOR_PERCENTILE)];
+        if (p.noiseFloor === null) p.noiseFloor = rawFloor;
+        else p.noiseFloor += (rawFloor - p.noiseFloor) * WF_AUTO_FLOOR_SMOOTHING;
+        var dbRange = (p.analyser.maxDecibels - p.analyser.minDecibels) || 70;
+        var spanBytes = WF_AUTO_DISPLAY_SPAN_DB * (255 / dbRange);
         for (var x = 0; x < w; x++) {
-          var binIdx = Math.floor(x * useBins / w);
-          var val = bins[binIdx];
-          // Color: dark blue -> cyan -> yellow -> red
-          var r, g, b;
-          if (val < 85) { r = 0; g = 0; b = Math.floor(val * 2); }
-          else if (val < 170) { r = 0; g = Math.floor((val - 85) * 3); b = 170; }
-          else { r = Math.floor((val - 170) * 3); g = 255; b = 170 - Math.floor((val - 170) * 2); }
-          p.ctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
+          var norm = (lineVals[x] - p.noiseFloor) / spanBytes;
+          if (norm < 0) norm = 0; else if (norm > 1) norm = 1;
+          var rgb = wfColorForNorm(norm);
+          p.ctx.fillStyle = 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
           p.ctx.fillRect(x, 0, 1, 1);
         }
       }
