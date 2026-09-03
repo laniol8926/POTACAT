@@ -3767,6 +3767,47 @@ function _applyPopoutTheme(payload) {
     if (jpWfSilentEl) jpWfSilentEl.classList.toggle('show', !!on);
   }
 
+  // Adaptive noise-floor tracking for the waterfall color ramp. Coloring
+  // straight off getByteFrequencyData()'s raw 0-255 (itself just a linear
+  // remap of the AnalyserNode's fixed minDecibels..maxDecibels, default
+  // -100..-30 dBFS) means ordinary band noise and a real signal both land
+  // in the low end of that fixed range — nothing ever reaches the top of
+  // the color ramp, so the whole display sits in the dark-blue band with
+  // only the strongest signals showing color. Estimating the floor fresh
+  // from each drawn line's own bins (a low percentile — low enough to sit
+  // under real signal tones, high enough to ignore a handful of
+  // anomalously-quiet bins) and re-centering the ramp on it every line
+  // gives the same contrast a real SDR waterfall has regardless of band
+  // conditions or the analyser's fixed dB range. Same approach as the
+  // generic-rig-backend zbitxd fork's waterfall_color_for_v()/
+  // update_noise_floor(), ported to AnalyserNode's byte-magnitude space.
+  var wfNoiseFloor = null;
+  var WF_AUTO_FLOOR_PERCENTILE = 0.10;
+  var WF_AUTO_FLOOR_SMOOTHING = 0.05;
+  var WF_AUTO_DISPLAY_SPAN_DB = 25; // dB above the floor mapped to full-scale color
+  function wfUpdateNoiseFloor(vals) {
+    var n = vals.length;
+    if (!n) return;
+    var sorted = Array.prototype.slice.call(vals).sort(function (a, b) { return a - b; });
+    var rawFloor = sorted[Math.floor(n * WF_AUTO_FLOOR_PERCENTILE)];
+    if (wfNoiseFloor === null) wfNoiseFloor = rawFloor;
+    else wfNoiseFloor += (rawFloor - wfNoiseFloor) * WF_AUTO_FLOOR_SMOOTHING;
+  }
+  // Maps a normalized 0-1 magnitude (already floor-subtracted and
+  // span-scaled by the caller) to an RGB color. Same 5-band blue -> cyan ->
+  // green -> yellow -> red ramp as zbitxd's waterfall_color_for_v(), each
+  // band normalized to its own 0..1 fraction before scaling to 0..255 so
+  // there's no banding discontinuity at the v=0.2/0.4/0.6/0.8 boundaries.
+  function wfColorForNorm(norm) {
+    var r, g, b, t;
+    if (norm < 0.2) { t = norm / 0.2; r = 0; g = 0; b = Math.round(t * 255); }
+    else if (norm < 0.4) { t = (norm - 0.2) / 0.2; r = 0; g = Math.round(t * 255); b = 255; }
+    else if (norm < 0.6) { t = (norm - 0.4) / 0.2; r = 0; g = 255; b = Math.round((1 - t) * 255); }
+    else if (norm < 0.8) { t = (norm - 0.6) / 0.2; r = Math.round(t * 255); g = 255; b = 0; }
+    else { t = Math.min(1, (norm - 0.8) / 0.2); r = 255; g = Math.round((1 - t) * 255); b = 0; }
+    return [r, g, b];
+  }
+
   // Waterfall rendering loop — driven by local AnalyserNode (no IPC)
   function popoutWaterfallLoop() {
     if (!popoutAnalyser) {
@@ -3849,18 +3890,23 @@ function _applyPopoutTheme(payload) {
         // Draw new line at top row, from the integrated frames
         var lineData = jpWfCtx.createImageData(w, 1);
         var invCount = wfAccumCount > 0 ? 1 / wfAccumCount : 1;
+        var lineVals = new Float32Array(w);
         for (var x = 0; x < w; x++) {
           var binIdx = Math.floor(x * passbandBins / w);
-          var val = wfAccum[binIdx] * invCount;
-          var norm = val / 255;
-          var r, g, b;
-          if (norm < 0.2) { r = 0; g = 0; b = Math.floor(norm * 5 * 140); }
-          else if (norm < 0.4) { var t = (norm - 0.2) * 5; r = 0; g = Math.floor(t * 255); b = 140 + Math.floor(t * 115); }
-          else if (norm < 0.6) { var t = (norm - 0.4) * 5; r = Math.floor(t * 255); g = 255; b = Math.floor((1 - t) * 255); }
-          else if (norm < 0.8) { var t = (norm - 0.6) * 5; r = 255; g = Math.floor((1 - t) * 255); b = 0; }
-          else { var t = (norm - 0.8) * 5; r = 255; g = Math.floor(t * 255); b = Math.floor(t * 255); }
+          lineVals[x] = wfAccum[binIdx] * invCount;
+        }
+        // Re-center the color ramp on THIS line's own noise floor before
+        // coloring it — see wfUpdateNoiseFloor above.
+        wfUpdateNoiseFloor(lineVals);
+        var dbRange = (popoutAnalyser.maxDecibels - popoutAnalyser.minDecibels) || 70;
+        var spanBytes = WF_AUTO_DISPLAY_SPAN_DB * (255 / dbRange);
+        var floor = wfNoiseFloor === null ? 0 : wfNoiseFloor;
+        for (var x = 0; x < w; x++) {
+          var norm = (lineVals[x] - floor) / spanBytes;
+          if (norm < 0) norm = 0; else if (norm > 1) norm = 1;
+          var rgb = wfColorForNorm(norm);
           var i = x * 4;
-          lineData.data[i] = r; lineData.data[i + 1] = g; lineData.data[i + 2] = b; lineData.data[i + 3] = 255;
+          lineData.data[i] = rgb[0]; lineData.data[i + 1] = rgb[1]; lineData.data[i + 2] = rgb[2]; lineData.data[i + 3] = 255;
         }
         jpWfCtx.putImageData(lineData, 0, 0);
         wfAccum.fill(0);
