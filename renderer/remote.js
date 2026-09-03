@@ -6906,6 +6906,44 @@
 
   // --- Waterfall rendering ---
   let ft8WfVisible = false;
+
+  // Adaptive noise-floor tracking for the color ramp — same fix and same
+  // rationale as the desktop popout's popoutWaterfallLoop() (renderer/
+  // jtcat-popout.js): `bins` is the shack's raw getByteFrequencyData()
+  // output forwarded over the wire as-is (see 'jtcat-spectrum' above), so
+  // it has the exact same problem — a fixed 0-255 range (linear off the
+  // sending AnalyserNode's fixed dB range, default -100..-30 dBFS, which
+  // nothing on the shack side overrides) means ordinary noise and a real
+  // signal both sit in the low end and the ramp's top half never gets
+  // used. Re-centering on each row's own 10th-percentile every line fixes
+  // that regardless of band conditions. 70 dB matches the AnalyserNode
+  // default the shack forwards from; there's no analyser here to read the
+  // real range off of since this is just a received byte array.
+  let ft8WfNoiseFloor = null;
+  const FT8_WF_AUTO_FLOOR_PERCENTILE = 0.10;
+  const FT8_WF_AUTO_FLOOR_SMOOTHING = 0.05;
+  const FT8_WF_AUTO_DISPLAY_SPAN_DB = 25; // dB above the floor mapped to full-scale color
+  const FT8_WF_ASSUMED_DB_RANGE = 70;     // AnalyserNode default (maxDecibels - minDecibels)
+  function ft8WfUpdateNoiseFloor(vals) {
+    const n = vals.length;
+    if (!n) return;
+    const sorted = Array.prototype.slice.call(vals).sort((a, b) => a - b);
+    const rawFloor = sorted[Math.floor(n * FT8_WF_AUTO_FLOOR_PERCENTILE)];
+    if (ft8WfNoiseFloor === null) ft8WfNoiseFloor = rawFloor;
+    else ft8WfNoiseFloor += (rawFloor - ft8WfNoiseFloor) * FT8_WF_AUTO_FLOOR_SMOOTHING;
+  }
+  // Same banding-free 5-band blue -> cyan -> green -> yellow -> red ramp as
+  // jtcat-popout.js's wfColorForNorm() / zbitxd's waterfall_color_for_v().
+  function ft8WfColorForNorm(norm) {
+    let r, g, b, t;
+    if (norm < 0.2) { t = norm / 0.2; r = 0; g = 0; b = Math.round(t * 255); }
+    else if (norm < 0.4) { t = (norm - 0.2) / 0.2; r = 0; g = Math.round(t * 255); b = 255; }
+    else if (norm < 0.6) { t = (norm - 0.4) / 0.2; r = 0; g = 255; b = Math.round((1 - t) * 255); }
+    else if (norm < 0.8) { t = (norm - 0.6) / 0.2; r = Math.round(t * 255); g = 255; b = 0; }
+    else { t = Math.min(1, (norm - 0.8) / 0.2); r = 255; g = Math.round((1 - t) * 255); b = 0; }
+    return [r, g, b];
+  }
+
   function ft8RenderWaterfall(bins) {
     if (!bins || !bins.length) return;
     if (!ft8WfVisible) return;
@@ -6918,13 +6956,15 @@
     ctx.putImageData(imgData, 0, 1);
     // Draw new row at top
     const step = bins.length / w;
+    const lineVals = new Float32Array(w);
+    for (let x = 0; x < w; x++) lineVals[x] = bins[Math.floor(x * step)] || 0;
+    ft8WfUpdateNoiseFloor(lineVals);
+    const spanBytes = FT8_WF_AUTO_DISPLAY_SPAN_DB * (255 / FT8_WF_ASSUMED_DB_RANGE);
+    const floor = ft8WfNoiseFloor === null ? 0 : ft8WfNoiseFloor;
     for (let x = 0; x < w; x++) {
-      const idx = Math.floor(x * step);
-      const val = bins[idx] || 0;
-      // Map 0-255 to color (blue->cyan->yellow->red)
-      const r = val > 170 ? 255 : val > 85 ? (val - 85) * 3 : 0;
-      const g = val > 170 ? 255 - (val - 170) * 3 : val > 85 ? 255 : val * 3;
-      const b = val > 85 ? 0 : 255 - val * 3;
+      let norm = (lineVals[x] - floor) / spanBytes;
+      if (norm < 0) norm = 0; else if (norm > 1) norm = 1;
+      const [r, g, b] = ft8WfColorForNorm(norm);
       ctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
       ctx.fillRect(x, 0, 1, 1);
     }
