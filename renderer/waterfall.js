@@ -4,7 +4,7 @@
 //
 // Consumes a stream of FFT magnitude frames via pushFrame() from ANY source
 // (audio-passband FFT for conventional radios, wideband panadapter FFT for a
-// Flex) and renders them as a scrolling heat-map on a WebGL2 canvas.
+// Flex) and renders them as a scrolling heat-map on a WebGL canvas.
 //
 // Rendering technique — borrowed in concept from AetherSDR's QRhi waterfall,
 // reimplemented in WebGL: the scrollback history is a fixed ring-buffer
@@ -13,15 +13,29 @@
 // fract(uv.y + rowOffset), so the whole display scrolls with no per-frame
 // redraw and no pixel copying.
 //
+// WebGL1, not WebGL2 — deliberately. Confirmed via a direct GPU diagnostic
+// (app.getGPUInfo() + a real getContext('webgl2') probe) that this project's
+// own ARM SBC target rejects WebGL2 outright ("ES3 is blocklisted/disabled/
+// unsupported by driver", glImplementationParts "gl=none,angle=none") while
+// WebGL1 works fine there. A prior WebGL2 version of this file rendered
+// completely blank on that hardware (2026-09-03). WebGL1 has no real
+// downside for what this component actually needs (a textured quad + a
+// couple of lines), so there's no reason to special-case WebGL2 on machines
+// that do support it — always requesting 'webgl' is simplest and most
+// portable. One real constraint this brings: WebGL1 requires power-of-two
+// texture dimensions for REPEAT wrapping (used on the ring buffer's row
+// axis) — historyRows must stay a power of two (256, 512, ...); bins (the
+// other axis, CLAMP_TO_EDGE) has no such restriction.
+//
 // Loaded via <script> (POTACAT's renderer has no ES modules) — defines the
 // global `Waterfall` class. See docs/waterfall-plan.md.
 
 (function (global) {
   'use strict';
 
-  const WF_VERT = `#version 300 es
-in vec2 a_pos;
-out vec2 v_uv;
+  const WF_VERT = `
+attribute vec2 a_pos;
+varying vec2 v_uv;
 void main() {
   v_uv = a_pos * 0.5 + 0.5;
   gl_Position = vec4(a_pos, 0.0, 1.0);
@@ -29,10 +43,9 @@ void main() {
 
   // Newest row sits near the top and the display scrolls down: as a frame is
   // pushed, rowOffset grows, so a fixed screen pixel samples a row 1/H lower.
-  const WF_FRAG = `#version 300 es
+  const WF_FRAG = `
 precision highp float;
-in vec2 v_uv;
-out vec4 fragColor;
+varying vec2 v_uv;
 uniform sampler2D u_tex;
 uniform float u_rowOffset;
 uniform int u_colormap;
@@ -55,20 +68,21 @@ vec3 cmTurbo(float t) {
 }
 void main() {
   float tv = fract(v_uv.y + u_rowOffset);
-  float m = texture(u_tex, vec2(v_uv.x, tv)).r;
+  // LUMINANCE texture (WebGL1 has no R8) — value lands in .r (and is
+  // replicated across .g/.b by the format; only .r is read here).
+  float m = texture2D(u_tex, vec2(v_uv.x, tv)).r;
   vec3 c = (u_colormap == 1) ? cmTurbo(m) : cmClassic(m);
-  fragColor = vec4(c, 1.0);
+  gl_FragColor = vec4(c, 1.0);
 }`;
 
-  const LINE_VERT = `#version 300 es
-in vec2 a_pos;
+  const LINE_VERT = `
+attribute vec2 a_pos;
 void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`;
 
-  const LINE_FRAG = `#version 300 es
+  const LINE_FRAG = `
 precision highp float;
-out vec4 fragColor;
 uniform vec4 u_color;
-void main() { fragColor = u_color; }`;
+void main() { gl_FragColor = u_color; }`;
 
   function compile(gl, type, src) {
     const s = gl.createShader(type);
@@ -101,13 +115,32 @@ void main() { fragColor = u_color; }`;
   class Waterfall {
     /**
      * @param {HTMLCanvasElement} canvas - a canvas with no prior 2D context.
-     * @param {object} opts - { bins, historyRows, colormap, gamma }
+     * @param {object} opts - { bins, historyRows, colormap, gamma,
+     *   floorSmoothing, peakDecay, peakAttack }
+     *   historyRows MUST be a power of two (WebGL1 REPEAT constraint).
+     *
+     *   floorSmoothing/peakDecay/peakAttack default to values tuned for a
+     *   ~60fps pushFrame() rate (the desktop popout's real rate). A caller
+     *   pushing much slower (e.g. ECHOCAT's ~10fps spectrum broadcast)
+     *   needs LARGER per-push floorSmoothing/peakAttack (and a SMALLER
+     *   peakDecay, i.e. more per-push release) to reach the same real-time
+     *   convergence speed — otherwise the adaptive range takes ~6x longer
+     *   in wall-clock time to settle, which reads as a background that
+     *   never quite goes dark even with real gain changes (confirmed live:
+     *   bad2.png/bad3.png, 2026-09-03 — background stayed a solid mid-blue
+     *   regardless of RX gain because the floor simply hadn't caught up
+     *   yet). See renderer/remote.js's ft8Wf construction for the
+     *   10fps-matched constants (derived from an exponential decay
+     *   time-constant match, not guessed).
      */
     constructor(canvas, opts = {}) {
       this.canvas = canvas;
       this.bins = Math.max(16, opts.bins || 1024);
       this.historyRows = Math.max(16, opts.historyRows || 512);
       this.gamma = opts.gamma || 0.5;
+      this._floorSmoothing = opts.floorSmoothing != null ? opts.floorSmoothing : 0.05;
+      this._peakDecay = opts.peakDecay != null ? opts.peakDecay : 0.97;
+      this._peakAttack = opts.peakAttack != null ? opts.peakAttack : 0.03;
       this._cmIndex = opts.colormap === 'turbo' ? 1 : 0;
       this._markers = [];
       this._clickCb = null;
@@ -121,12 +154,12 @@ void main() { fragColor = u_color; }`;
       this._writeRow = 0;
       this._rowU8 = new Uint8Array(this.bins);
 
-      const gl = canvas.getContext('webgl2', {
+      const gl = canvas.getContext('webgl', {
         antialias: false, depth: false, premultipliedAlpha: false,
       });
       this.supported = !!gl;
       if (!gl) {
-        console.warn('[Waterfall] WebGL2 unavailable — waterfall disabled');
+        console.warn('[Waterfall] WebGL unavailable — waterfall disabled');
         return;
       }
       this.gl = gl;
@@ -161,16 +194,18 @@ void main() { fragColor = u_color; }`;
       ]), gl.STATIC_DRAW);
       this._lineBuf = gl.createBuffer();
 
-      // Ring-buffer history texture: R8, bins wide x historyRows tall.
+      // Ring-buffer history texture: LUMINANCE (WebGL1 has no sized R8
+      // internal format — LUMINANCE is the single-channel 8-bit equivalent
+      // core WebGL1 actually supports), bins wide x historyRows tall.
       this._tex = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, this._tex);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, this.bins, this.historyRows, 0,
-                    gl.RED, gl.UNSIGNED_BYTE, null);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, this.bins, this.historyRows, 0,
+                    gl.LUMINANCE, gl.UNSIGNED_BYTE, null);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT); // wraps the ring
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT); // wraps the ring — needs historyRows POT
 
       this._uTex = gl.getUniformLocation(this._wfProg, 'u_tex');
       this._uRowOffset = gl.getUniformLocation(this._wfProg, 'u_rowOffset');
@@ -199,8 +234,24 @@ void main() { fragColor = u_color; }`;
       if (!this._rangeInit) {
         this._floor = lo; this._peak = hi; this._rangeInit = true;
       } else {
-        this._floor += 0.05 * (lo - this._floor);
-        this._peak = Math.max(this._peak * 0.97 + hi * 0.03, hi);
+        this._floor += this._floorSmoothing * (lo - this._floor);
+        if (hi >= this._peak) {
+          // Fast but SMOOTH attack, not an instant snap. The instant
+          // Math.max(...) this replaces gave the row that first caught a
+          // new high value a discontinuously different effective range
+          // than its immediate neighbors — confirmed live as the cause of
+          // a "narrow in the middle, fans out at the edges" artifact on
+          // every trace's onset/offset (bad4.png/bad5.png, 2026-09-03,
+          // reproduced at normal RX gain so it wasn't a saturation
+          // artifact): the same underlying signal's box-averaged
+          // bleed-over into neighboring bins crossed the visibility
+          // threshold inconsistently row-to-row because the range itself
+          // wasn't stable row-to-row. 0.5 still converges within ~1-2
+          // pushes (not sluggish), just without the single-frame jump.
+          this._peak += 0.5 * (hi - this._peak);
+        } else {
+          this._peak = this._peak * this._peakDecay + hi * this._peakAttack;
+        }
       }
       const range = Math.max(1e-6, this._peak - this._floor);
       const g = this.gamma;
@@ -214,7 +265,7 @@ void main() { fragColor = u_color; }`;
       gl.bindTexture(gl.TEXTURE_2D, this._tex);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, this._writeRow, n, 1,
-                       gl.RED, gl.UNSIGNED_BYTE, this._rowU8);
+                       gl.LUMINANCE, gl.UNSIGNED_BYTE, this._rowU8);
       this._writeRow = (this._writeRow + 1) % this.historyRows;
       this._render();
     }
