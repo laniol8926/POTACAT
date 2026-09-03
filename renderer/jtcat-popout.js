@@ -2106,6 +2106,9 @@ function _applyPopoutTheme(payload) {
         // Draw new line at top
         var bins = new Uint8Array(p.analyser.frequencyBinCount);
         p.analyser.getByteFrequencyData(bins);
+        // Frequency-domain averaging (see boxAverageBins above) before
+        // downsampling to canvas width.
+        var binsSmoothed = boxAverageBins(bins, bins.length, WF_BINS_PER_OUTPUT);
         // Map 0-3kHz (FT8 passband) to canvas width
         // AudioContext sample rate is typically 48kHz, so 3kHz = bins * (3000 / (sampleRate/2))
         var nyquist = (p.sampleRate || 48000) / 2;
@@ -2117,7 +2120,7 @@ function _applyPopoutTheme(payload) {
         // single-pane wfNoiseFloor/wfPeak — different slices can sit on
         // different bands with very different real noise levels.
         var lineVals = new Float32Array(w);
-        for (var x = 0; x < w; x++) lineVals[x] = bins[Math.floor(x * useBins / w)];
+        for (var x = 0; x < w; x++) lineVals[x] = binsSmoothed[Math.floor(x * useBins / w)];
         var sorted = Array.prototype.slice.call(lineVals).sort(function (a, b) { return a - b; });
         var rawFloor = sorted[Math.floor(w * WF_AUTO_FLOOR_PERCENTILE)];
         var hi = sorted[w - 1];
@@ -3715,6 +3718,34 @@ function _applyPopoutTheme(payload) {
   });
 
   // --- Waterfall ---
+  // Frequency-domain (spatial) averaging — WSJT-X's own "Bins/Pixel"
+  // setting (4 by default, confirmed against a real WSJT-X session,
+  // target.png 2026-09-03) averages several adjacent raw FFT bins into
+  // each displayed value, which is what actually suppresses a
+  // periodogram's inherent bin-to-bin raggedness (adjacent bins of pure
+  // noise are ~independent random draws — averaging N of them reduces
+  // variance by ~1/N; confirmed with a synthetic tone+noise test on the
+  // equivalent fix in lib/spectrum-fft.js: noise stddev 16.8 -> 10.4).
+  // Two rounds of TEMPORAL-only smoothing (frame-to-frame) here didn't
+  // fix the "still speckled" complaint (and one overshot into visible
+  // blur) — this is a different mechanism, applied on ITS OWN this round
+  // so any improvement (or lack of one) is attributable to this alone.
+  // Sliding box average (window wider than the 1-bin stride, so adjacent
+  // outputs' windows overlap), NOT a downsample — same array length out.
+  var WF_BINS_PER_OUTPUT = 4;
+  function boxAverageBins(raw, count, windowBins) {
+    var half = windowBins / 2;
+    var out = new Float32Array(count);
+    for (var i = 0; i < count; i++) {
+      var lo = Math.max(0, Math.round(i - half));
+      var hi = Math.min(count, Math.max(lo + 1, Math.round(i + half)));
+      var sum = 0;
+      for (var k = lo; k < hi; k++) sum += raw[k];
+      out[i] = sum / (hi - lo);
+    }
+    return out;
+  }
+
   var jpWaterfall = document.getElementById('jp-waterfall');
   var jpWfCtx = jpWaterfall.getContext('2d');
 
@@ -3903,14 +3934,16 @@ function _applyPopoutTheme(payload) {
       var w = jpWaterfall.width;
       var h = jpWaterfall.height;
 
-      // Integrate this frame. At the default 60 lines/sec a line is drawn
-      // every frame and the average is over a single frame, so the display is
-      // bit-for-bit what it always was.
-      if (!wfAccum || wfAccum.length !== freqData.length) {
-        wfAccum = new Float32Array(freqData.length);
+      // Frequency-domain averaging first (see boxAverageBins above), THEN
+      // integrate this frame. At the default 60 lines/sec a line is drawn
+      // every frame and the average is over a single (now bin-averaged)
+      // frame.
+      var freqDataSmoothed = boxAverageBins(freqData, freqData.length, WF_BINS_PER_OUTPUT);
+      if (!wfAccum || wfAccum.length !== freqDataSmoothed.length) {
+        wfAccum = new Float32Array(freqDataSmoothed.length);
         wfAccumCount = 0;
       }
-      for (var ai = 0; ai < freqData.length; ai++) wfAccum[ai] += freqData[ai];
+      for (var ai = 0; ai < freqDataSmoothed.length; ai++) wfAccum[ai] += freqDataSmoothed[ai];
       wfAccumCount++;
 
       var wfNowMs = Date.now();
@@ -3996,12 +4029,14 @@ function _applyPopoutTheme(payload) {
         window.api.jtcatQuietFreq(Math.max(200, Math.min(2800, quietHz)));
       }
 
-      // Send spectrum to main process for remote/ECHOCAT (~10fps)
+      // Send spectrum to main process for remote/ECHOCAT (~10fps). Bin-
+      // averaged (freqDataSmoothed), same as the local waterfall draws —
+      // see boxAverageBins above.
       popoutSpectrumFrame++;
       if (popoutSpectrumFrame % 6 === 0) {
         var specBins = new Array(w);
         for (var sx = 0; sx < w; sx++) {
-          specBins[sx] = freqData[Math.floor(sx * passbandBins / w)];
+          specBins[sx] = freqDataSmoothed[Math.floor(sx * passbandBins / w)];
         }
         window.api.jtcatSpectrum(specBins);
       }
