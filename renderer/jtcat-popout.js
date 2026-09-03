@@ -1992,7 +1992,16 @@ function _applyPopoutTheme(payload) {
           if (!entry.analyser) {
             entry.analyser = entry.ctx.createAnalyser();
             entry.analyser.fftSize = 2048;
-            entry.analyser.smoothingTimeConstant = 0.3;
+            // 0.75, up from 0.3 — a single (or lightly-smoothed) FFT frame
+            // of real noise is inherently ragged bin-to-bin (genuine
+            // periodogram statistics, not a bug); no amount of color
+            // remapping fixes that, only actual averaging does. This is
+            // AnalyserNode's own built-in exponential frame averaging —
+            // the same role WSJT-X's "N Avg"/"Smooth" settings play
+            // (target.png, 2026-09-03) — so no hand-rolled buffer needed.
+            // FT8 content doesn't change within a ~12.6s transmission, so
+            // heavier smoothing costs nothing real here.
+            entry.analyser.smoothingTimeConstant = 0.75;
             // Connect the source to the analyser
             var src = entry.ctx.createMediaStreamSource(entry.stream);
             src.connect(entry.analyser);
@@ -2087,53 +2096,31 @@ function _applyPopoutTheme(payload) {
       if (entry && entry.ctx && entry.stream) {
         analyser = entry.ctx.createAnalyser();
         analyser.fftSize = 1024;
-        analyser.smoothingTimeConstant = 0.3;
+        analyser.smoothingTimeConstant = 0.75; // see the multi-slice analyser above
         var src = entry.ctx.createMediaStreamSource(entry.stream);
         src.connect(analyser);
       }
 
-      multiWfPanes.push({ sliceId: cfg.sliceId, canvas: canvas, ctx: canvas.getContext('2d'), analyser: analyser, sampleRate: entry ? entry.ctx.sampleRate : 48000, txLine: txLine, txHz: txHz, noiseFloor: null, peak: null });
+      // GPU waterfall (renderer/waterfall.js) — same shared component the
+      // SSTV popout uses and the main JTCAT waterfall below was just moved
+      // to. Replaces a third hand-rolled canvas colorer (see
+      // popoutWaterfallLoop's comment) with adaptive floor+peak ranging
+      // built in, per-pane, no shared state needed across panes.
+      var wf = new Waterfall(canvas, { bins: 256, historyRows: 256, colormap: 'classic', gamma: 1 });
+      multiWfPanes.push({ sliceId: cfg.sliceId, canvas: canvas, wf: wf, analyser: analyser, sampleRate: entry ? entry.ctx.sampleRate : 48000, txLine: txLine, txHz: txHz });
     });
 
     // Start waterfall animation loop
     function drawMultiWf() {
       for (var p of multiWfPanes) {
-        if (!p.analyser || !p.ctx) continue;
-        var w = p.canvas.width, h = p.canvas.height;
-        // Scroll down
-        var imgData = p.ctx.getImageData(0, 0, w, h - 1);
-        p.ctx.putImageData(imgData, 0, 1);
-        // Draw new line at top
+        if (!p.analyser || !p.wf || !p.wf.supported) continue;
         var bins = new Uint8Array(p.analyser.frequencyBinCount);
         p.analyser.getByteFrequencyData(bins);
-        // Map 0-3kHz (FT8 passband) to canvas width
-        // AudioContext sample rate is typically 48kHz, so 3kHz = bins * (3000 / (sampleRate/2))
+        // Map 0-3kHz (FT8 passband) — AudioContext sample rate is typically
+        // 48kHz, so 3kHz worth of bins = bins.length * (3000 / (sampleRate/2)).
         var nyquist = (p.sampleRate || 48000) / 2;
-        var useBins = Math.max(1, Math.floor(bins.length * 3000 / nyquist));
-        // Adaptive floor+peak coloring — same fix as popoutWaterfallLoop
-        // (see wfUpdateFloorAndPeak/wfColorForNorm above) and
-        // ft8RenderWaterfall in renderer/remote.js, ported a third time
-        // here. Each pane tracks its own floor/peak rather than sharing the
-        // single-pane wfNoiseFloor/wfPeak — different slices can sit on
-        // different bands with very different real noise levels.
-        var lineVals = new Float32Array(w);
-        for (var x = 0; x < w; x++) lineVals[x] = bins[Math.floor(x * useBins / w)];
-        var sorted = Array.prototype.slice.call(lineVals).sort(function (a, b) { return a - b; });
-        var rawFloor = sorted[Math.floor(w * WF_AUTO_FLOOR_PERCENTILE)];
-        var hi = sorted[w - 1];
-        if (p.noiseFloor === null) { p.noiseFloor = rawFloor; p.peak = hi; }
-        else {
-          p.noiseFloor += (rawFloor - p.noiseFloor) * WF_AUTO_FLOOR_SMOOTHING;
-          p.peak = Math.max(p.peak * WF_AUTO_PEAK_DECAY + hi * WF_AUTO_PEAK_ATTACK, hi);
-        }
-        var range = Math.max(1e-6, p.peak - p.noiseFloor);
-        for (var x = 0; x < w; x++) {
-          var norm = (lineVals[x] - p.noiseFloor) / range;
-          if (norm < 0) norm = 0; else if (norm > 1) norm = 1;
-          var rgb = wfColorForNorm(norm);
-          p.ctx.fillStyle = 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
-          p.ctx.fillRect(x, 0, 1, 1);
-        }
+        var passbandBins = Math.max(1, Math.floor(bins.length * 3000 / nyquist));
+        p.wf.pushFrame(bins.subarray(0, passbandBins));
       }
       multiWfAnim = requestAnimationFrame(drawMultiWf);
     }
@@ -3529,7 +3516,7 @@ function _applyPopoutTheme(payload) {
 
       popoutAnalyser = popoutAudioCtx.createAnalyser();
       popoutAnalyser.fftSize = 2048;
-      popoutAnalyser.smoothingTimeConstant = 0.3;
+      popoutAnalyser.smoothingTimeConstant = 0.75; // see the multi-slice analyser above
       popoutRxGainNode.connect(popoutAnalyser);
 
       console.log('[JTCAT popout] AudioContext sample rate:', nativeRate, 'dsRatio:', dsRatio.toFixed(2));
@@ -3715,27 +3702,17 @@ function _applyPopoutTheme(payload) {
   });
 
   // --- Waterfall ---
+  // GPU waterfall (renderer/waterfall.js) — the same shared component the
+  // SSTV popout already used successfully. Replaces hand-rolled canvas
+  // 2D scroll/color code that, even after adding adaptive floor+peak
+  // ranging by hand, still looked wrong against a real reference (WSJT-X)
+  // — real averaging (temporal + this component's own ranging) matters
+  // more than the color math alone. The component owns its own resize via
+  // ResizeObserver — ring-buffer texture content isn't lost across a
+  // resize the way manual canvas.width/height reassignment used to require
+  // explicit getImageData/putImageData save-restore for.
   var jpWaterfall = document.getElementById('jp-waterfall');
-  var jpWfCtx = jpWaterfall.getContext('2d');
-
-  function resizeWaterfall() {
-    var rect = jpWaterfall.getBoundingClientRect();
-    var dpr = window.devicePixelRatio || 1;
-    var newW = Math.round(rect.width * dpr);
-    var newH = Math.round(rect.height * dpr);
-    if (newW > 0 && newH > 0 && (jpWaterfall.width !== newW || jpWaterfall.height !== newH)) {
-      // Save existing content before resize (setting width/height clears canvas)
-      var oldData = null;
-      try { oldData = jpWfCtx.getImageData(0, 0, jpWaterfall.width, jpWaterfall.height); } catch(e) {}
-      jpWaterfall.width = newW;
-      jpWaterfall.height = newH;
-      if (oldData) {
-        jpWfCtx.putImageData(oldData, 0, 0);
-      }
-    }
-  }
-  resizeWaterfall();
-  window.addEventListener('resize', resizeWaterfall);
+  var jpWaterfallGl = new Waterfall(jpWaterfall, { bins: 512, historyRows: 512, colormap: 'classic', gamma: 1 });
 
   // --- RX-silent watchdog (Flex only) ---
   // A dead DAX stream — the slice isn't routed to POTACAT's DAX RX channel, the
@@ -3778,70 +3755,6 @@ function _applyPopoutTheme(payload) {
   var wfSilentCause = '';      // 'gain' | 'silent' — which text the overlay carries
   function setWfSilentOverlay(on) {
     if (jpWfSilentEl) jpWfSilentEl.classList.toggle('show', !!on);
-  }
-
-  // Adaptive noise-floor tracking for the waterfall color ramp. Coloring
-  // straight off getByteFrequencyData()'s raw 0-255 (itself just a linear
-  // remap of the AnalyserNode's fixed minDecibels..maxDecibels, default
-  // -100..-30 dBFS) means ordinary band noise and a real signal both land
-  // in the low end of that fixed range — nothing ever reaches the top of
-  // the color ramp, so the whole display sits in the dark-blue band with
-  // only the strongest signals showing color. Estimating the floor fresh
-  // from each drawn line's own bins (a low percentile — low enough to sit
-  // under real signal tones, high enough to ignore a handful of
-  // anomalously-quiet bins) and re-centering the ramp on it every line
-  // gives the same contrast a real SDR waterfall has regardless of band
-  // conditions or the analyser's fixed dB range. Same approach as the
-  // generic-rig-backend zbitxd fork's waterfall_color_for_v()/
-  // update_noise_floor(), ported to AnalyserNode's byte-magnitude space.
-  // A FIXED dB span above the floor (the first cut of this fix) turned out
-  // wrong in practice: getByteFrequencyData()'s raw bins are single-frame
-  // periodogram values, which are inherently ragged bin-to-bin (classic
-  // FFT-of-noise raggedness — real, not a bug), so a single row's own
-  // noise ALONE can already span most of a modest fixed dB window. Result:
-  // ordinary noise painted across the whole ramp instead of staying dark
-  // (confirmed on real hardware — waterfall1.png, 2026-09-03). Switched to
-  // the same adaptive floor-AND-peak range renderer/waterfall.js already
-  // uses for SSTV (its pushFrame(), Waterfall class): floor slow-tracks a
-  // low percentile, peak fast-attacks/slow-decays the row's own max, and
-  // the color range is peak-floor — self-scaling to whatever this row's
-  // real dynamic range actually is instead of a guessed constant, so it
-  // can't blow out the same way.
-  var wfNoiseFloor = null;
-  var wfPeak = null;
-  var WF_AUTO_FLOOR_PERCENTILE = 0.10;
-  var WF_AUTO_FLOOR_SMOOTHING = 0.05;
-  var WF_AUTO_PEAK_DECAY = 0.97;   // per-line retention — slow release
-  var WF_AUTO_PEAK_ATTACK = 0.03;  // per-line pull toward a higher peak
-  function wfUpdateFloorAndPeak(vals) {
-    var n = vals.length;
-    if (!n) return;
-    var sorted = Array.prototype.slice.call(vals).sort(function (a, b) { return a - b; });
-    var rawFloor = sorted[Math.floor(n * WF_AUTO_FLOOR_PERCENTILE)];
-    var hi = sorted[n - 1];
-    if (wfNoiseFloor === null) { wfNoiseFloor = rawFloor; wfPeak = hi; }
-    else {
-      wfNoiseFloor += (rawFloor - wfNoiseFloor) * WF_AUTO_FLOOR_SMOOTHING;
-      // Fast attack (Math.max snaps up immediately to a new high), slow
-      // decay (drifts down 3%/line otherwise) — an envelope follower, so a
-      // burst of strong signals doesn't get instantly washed out the
-      // moment the very next line is quieter.
-      wfPeak = Math.max(wfPeak * WF_AUTO_PEAK_DECAY + hi * WF_AUTO_PEAK_ATTACK, hi);
-    }
-  }
-  // Maps a normalized 0-1 magnitude (already floor-subtracted and
-  // span-scaled by the caller) to an RGB color. Same 5-band blue -> cyan ->
-  // green -> yellow -> red ramp as zbitxd's waterfall_color_for_v(), each
-  // band normalized to its own 0..1 fraction before scaling to 0..255 so
-  // there's no banding discontinuity at the v=0.2/0.4/0.6/0.8 boundaries.
-  function wfColorForNorm(norm) {
-    var r, g, b, t;
-    if (norm < 0.2) { t = norm / 0.2; r = 0; g = 0; b = Math.round(t * 255); }
-    else if (norm < 0.4) { t = (norm - 0.2) / 0.2; r = 0; g = Math.round(t * 255); b = 255; }
-    else if (norm < 0.6) { t = (norm - 0.4) / 0.2; r = 0; g = 255; b = Math.round((1 - t) * 255); }
-    else if (norm < 0.8) { t = (norm - 0.6) / 0.2; r = Math.round(t * 255); g = 255; b = 0; }
-    else { t = Math.min(1, (norm - 0.8) / 0.2); r = 255; g = Math.round((1 - t) * 255); b = 0; }
-    return [r, g, b];
   }
 
   // Waterfall rendering loop — driven by local AnalyserNode (no IPC)
@@ -3900,80 +3813,37 @@ function _applyPopoutTheme(payload) {
         if (wfSilentShown) { setWfSilentOverlay(false); wfSilentShown = false; }
       }
 
-      var w = jpWaterfall.width;
-      var h = jpWaterfall.height;
-
-      // Integrate this frame. At the default 60 lines/sec a line is drawn
-      // every frame and the average is over a single frame, so the display is
-      // bit-for-bit what it always was.
-      if (!wfAccum || wfAccum.length !== freqData.length) {
-        wfAccum = new Float32Array(freqData.length);
+      // Integrate this frame. At the default 60 lines/sec a line is pushed
+      // every tick and the average is over a single frame, so the display
+      // is bit-for-bit what it always was; slower settings integrate
+      // several frames per pushed row, same as before.
+      if (!wfAccum || wfAccum.length !== passbandBins) {
+        wfAccum = new Float32Array(passbandBins);
         wfAccumCount = 0;
       }
-      for (var ai = 0; ai < freqData.length; ai++) wfAccum[ai] += freqData[ai];
+      for (var ai = 0; ai < passbandBins; ai++) wfAccum[ai] += freqData[ai];
       wfAccumCount++;
 
       var wfNowMs = Date.now();
       // >=60 means "every animation frame" — don't let timer jitter drop lines.
       var dueForLine = wfLinesPerSec >= 60 || (wfNowMs - wfLastLineTs) >= (1000 / wfLinesPerSec);
-      if (dueForLine) {
+      if (dueForLine && jpWaterfallGl.supported) {
         wfLastLineTs = wfNowMs;
-
-        // Scroll existing image down by 1 pixel
-        var imgData = jpWfCtx.getImageData(0, 0, w, h - 1);
-        jpWfCtx.putImageData(imgData, 0, 1);
-
-        // Draw new line at top row, from the integrated frames
-        var lineData = jpWfCtx.createImageData(w, 1);
         var invCount = wfAccumCount > 0 ? 1 / wfAccumCount : 1;
-        var lineVals = new Float32Array(w);
-        for (var x = 0; x < w; x++) {
-          var binIdx = Math.floor(x * passbandBins / w);
-          lineVals[x] = wfAccum[binIdx] * invCount;
-        }
-        // Re-center the color ramp on THIS line's own floor/peak before
-        // coloring it — see wfUpdateFloorAndPeak above.
-        wfUpdateFloorAndPeak(lineVals);
-        var floor = wfNoiseFloor === null ? 0 : wfNoiseFloor;
-        var range = Math.max(1e-6, (wfPeak === null ? 255 : wfPeak) - floor);
-        for (var x = 0; x < w; x++) {
-          var norm = (lineVals[x] - floor) / range;
-          if (norm < 0) norm = 0; else if (norm > 1) norm = 1;
-          var rgb = wfColorForNorm(norm);
-          var i = x * 4;
-          lineData.data[i] = rgb[0]; lineData.data[i + 1] = rgb[1]; lineData.data[i + 2] = rgb[2]; lineData.data[i + 3] = 255;
-        }
-        jpWfCtx.putImageData(lineData, 0, 0);
+        for (var ai2 = 0; ai2 < passbandBins; ai2++) wfAccum[ai2] *= invCount;
+        jpWaterfallGl.pushFrame(wfAccum);
         wfAccum.fill(0);
         wfAccumCount = 0;
       }
 
-      // RX marker (green) — pulses when receiving
-      var rxX = Math.round(jpRxFreqHz / 3000 * w);
-      var txX = Math.round(jpTxFreqHz / 3000 * w);
-      var pulse = (Math.sin(Date.now() / 200) + 1) / 2; // 0-1 oscillation
-      var rxGlow = !transmitting ? 2 + pulse * 4 : 0;
-      var txGlow = transmitting ? 2 + pulse * 4 : 0;
-      // RX line
-      if (rxGlow > 0) {
-        jpWfCtx.shadowColor = '#4ecca3';
-        jpWfCtx.shadowBlur = rxGlow;
-      }
-      jpWfCtx.fillStyle = '#000';
-      jpWfCtx.fillRect(rxX - 3, 0, 7, h);
-      jpWfCtx.fillStyle = '#4ecca3';
-      jpWfCtx.fillRect(rxX - 2, 0, 5, h);
-      jpWfCtx.shadowBlur = 0;
-      // TX marker (red) — pulses when transmitting
-      if (txGlow > 0) {
-        jpWfCtx.shadowColor = '#ff2222';
-        jpWfCtx.shadowBlur = txGlow;
-      }
-      jpWfCtx.fillStyle = '#000';
-      jpWfCtx.fillRect(txX - 2, 0, 5, h);
-      jpWfCtx.fillStyle = '#ff2222';
-      jpWfCtx.fillRect(txX - 1, 0, 3, h);
-      jpWfCtx.shadowBlur = 0;
+      // RX (green) / TX (red) markers, positioned as a 0..1 fraction of the
+      // 3000 Hz passband — see Waterfall.setMarkers(). No pulse animation
+      // (the old canvas version's shadowBlur glow); a plain line matches
+      // the reference waterfall (target.png) closer than an animated one.
+      jpWaterfallGl.setMarkers([
+        { pos: jpRxFreqHz / 3000, color: [0.31, 0.8, 0.64, 1] },
+        { pos: jpTxFreqHz / 3000, color: [1, 0.13, 0.13, 1] },
+      ]);
 
       // Auto-detect quietest TX frequency (~every 0.5s)
       popoutQuietFreqFrame++;
@@ -3996,13 +3866,14 @@ function _applyPopoutTheme(payload) {
         window.api.jtcatQuietFreq(Math.max(200, Math.min(2800, quietHz)));
       }
 
-      // Send spectrum to main process for remote/ECHOCAT (~10fps)
+      // Send spectrum to main process for remote/ECHOCAT (~10fps). Raw
+      // passband bins, unstretched — the receiving Waterfall component
+      // (renderer/remote.js) resamples to its own bin count itself, same
+      // as this popout's own jpWaterfallGl.pushFrame() above.
       popoutSpectrumFrame++;
       if (popoutSpectrumFrame % 6 === 0) {
-        var specBins = new Array(w);
-        for (var sx = 0; sx < w; sx++) {
-          specBins[sx] = freqData[Math.floor(sx * passbandBins / w)];
-        }
+        var specBins = new Array(passbandBins);
+        for (var sx = 0; sx < passbandBins; sx++) specBins[sx] = freqData[sx];
         window.api.jtcatSpectrum(specBins);
       }
     } catch (err) {

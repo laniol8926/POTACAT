@@ -10224,6 +10224,16 @@ function _releaseSpectrumPowerSave() {
   _spectrumPowerSaveId = null;
 }
 
+// Exponential frame smoothing for the in-process spectrum fallback — mirrors
+// AnalyserNode.smoothingTimeConstant (see renderer/jtcat-popout.js), which
+// this path has no equivalent of on its own: computeSpectrumBins() returns a
+// fresh, completely independent FFT each call, so without this every ECHOCAT
+// waterfall frame is raw single-frame periodogram noise (inherently ragged
+// bin-to-bin — real FFT-of-noise statistics, not a bug) with nothing
+// blending it across time. 0.75 matches the popout analyser's weighting.
+const SPECTRUM_SMOOTHING = 0.75;
+let _spectrumSmoothed = null;
+
 function startInProcessSpectrum() {
   // Blocker only while a phone is actually connected — an armed-but-idle loop
   // during a disconnect must not keep the desktop awake.
@@ -10237,11 +10247,18 @@ function startInProcessSpectrum() {
       ft8Engine._audioOffset || 0,
       SPECTRUM_BIN_COUNT,
     );
-    // Convert Uint8Array to plain array — JSON.stringify on Uint8Array
-    // emits an object with numeric string keys, not what the protocol
+    if (!_spectrumSmoothed || _spectrumSmoothed.length !== bins.length) {
+      _spectrumSmoothed = Float32Array.from(bins);
+    } else {
+      for (let i = 0; i < bins.length; i++) {
+        _spectrumSmoothed[i] = SPECTRUM_SMOOTHING * _spectrumSmoothed[i] + (1 - SPECTRUM_SMOOTHING) * bins[i];
+      }
+    }
+    // Convert to a plain array of rounded ints — JSON.stringify on a typed
+    // array emits an object with numeric string keys, not what the protocol
     // validator expects.
     const out = new Array(bins.length);
-    for (let i = 0; i < bins.length; i++) out[i] = bins[i];
+    for (let i = 0; i < bins.length; i++) out[i] = Math.round(_spectrumSmoothed[i]);
     remoteServer.broadcastJtcatSpectrum(out);
   }, SPECTRUM_INTERVAL_MS);
   console.log('[JTCAT] In-process spectrum loop started');
@@ -10249,6 +10266,7 @@ function startInProcessSpectrum() {
 
 function stopInProcessSpectrum() {
   _releaseSpectrumPowerSave();
+  _spectrumSmoothed = null; // don't blend a stale frame into the next session
   if (!_spectrumTimer) return;
   clearInterval(_spectrumTimer);
   _spectrumTimer = null;
