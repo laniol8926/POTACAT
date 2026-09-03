@@ -6907,30 +6907,38 @@
   // --- Waterfall rendering ---
   let ft8WfVisible = false;
 
-  // Adaptive noise-floor tracking for the color ramp — same fix and same
-  // rationale as the desktop popout's popoutWaterfallLoop() (renderer/
-  // jtcat-popout.js): `bins` is the shack's raw getByteFrequencyData()
-  // output forwarded over the wire as-is (see 'jtcat-spectrum' above), so
-  // it has the exact same problem — a fixed 0-255 range (linear off the
-  // sending AnalyserNode's fixed dB range, default -100..-30 dBFS, which
-  // nothing on the shack side overrides) means ordinary noise and a real
-  // signal both sit in the low end and the ramp's top half never gets
-  // used. Re-centering on each row's own 10th-percentile every line fixes
-  // that regardless of band conditions. 70 dB matches the AnalyserNode
-  // default the shack forwards from; there's no analyser here to read the
-  // real range off of since this is just a received byte array.
+  // Adaptive floor+peak tracking for the color ramp — same rationale as the
+  // desktop popout's popoutWaterfallLoop() (renderer/jtcat-popout.js):
+  // `bins` is the shack's raw getByteFrequencyData() output forwarded over
+  // the wire as-is (see 'jtcat-spectrum' above). A first cut used a FIXED
+  // dB span above the floor, which turned out wrong in practice — a raw
+  // single-frame periodogram is inherently ragged bin-to-bin, so a row's
+  // own noise ALONE can already span most of a modest fixed window
+  // (confirmed on real hardware — waterfall2.png, 2026-09-03, was almost
+  // entirely oversaturated green/cyan). Switched to the same adaptive
+  // floor-AND-peak range renderer/waterfall.js already uses for SSTV: floor
+  // slow-tracks a low percentile, peak fast-attacks/slow-decays the row's
+  // own max, and the color range is peak-floor — self-scaling to whatever
+  // this row's real dynamic range actually is, so it can't blow out the
+  // same way a guessed constant did. No AnalyserNode dB range needed
+  // either now — one less assumption about the shack's forwarding source.
   let ft8WfNoiseFloor = null;
+  let ft8WfPeak = null;
   const FT8_WF_AUTO_FLOOR_PERCENTILE = 0.10;
   const FT8_WF_AUTO_FLOOR_SMOOTHING = 0.05;
-  const FT8_WF_AUTO_DISPLAY_SPAN_DB = 25; // dB above the floor mapped to full-scale color
-  const FT8_WF_ASSUMED_DB_RANGE = 70;     // AnalyserNode default (maxDecibels - minDecibels)
-  function ft8WfUpdateNoiseFloor(vals) {
+  const FT8_WF_AUTO_PEAK_DECAY = 0.97;   // per-row retention — slow release
+  const FT8_WF_AUTO_PEAK_ATTACK = 0.03;  // per-row pull toward a higher peak
+  function ft8WfUpdateFloorAndPeak(vals) {
     const n = vals.length;
     if (!n) return;
     const sorted = Array.prototype.slice.call(vals).sort((a, b) => a - b);
     const rawFloor = sorted[Math.floor(n * FT8_WF_AUTO_FLOOR_PERCENTILE)];
-    if (ft8WfNoiseFloor === null) ft8WfNoiseFloor = rawFloor;
-    else ft8WfNoiseFloor += (rawFloor - ft8WfNoiseFloor) * FT8_WF_AUTO_FLOOR_SMOOTHING;
+    const hi = sorted[n - 1];
+    if (ft8WfNoiseFloor === null) { ft8WfNoiseFloor = rawFloor; ft8WfPeak = hi; }
+    else {
+      ft8WfNoiseFloor += (rawFloor - ft8WfNoiseFloor) * FT8_WF_AUTO_FLOOR_SMOOTHING;
+      ft8WfPeak = Math.max(ft8WfPeak * FT8_WF_AUTO_PEAK_DECAY + hi * FT8_WF_AUTO_PEAK_ATTACK, hi);
+    }
   }
   // Same banding-free 5-band blue -> cyan -> green -> yellow -> red ramp as
   // jtcat-popout.js's wfColorForNorm() / zbitxd's waterfall_color_for_v().
@@ -6958,11 +6966,11 @@
     const step = bins.length / w;
     const lineVals = new Float32Array(w);
     for (let x = 0; x < w; x++) lineVals[x] = bins[Math.floor(x * step)] || 0;
-    ft8WfUpdateNoiseFloor(lineVals);
-    const spanBytes = FT8_WF_AUTO_DISPLAY_SPAN_DB * (255 / FT8_WF_ASSUMED_DB_RANGE);
+    ft8WfUpdateFloorAndPeak(lineVals);
     const floor = ft8WfNoiseFloor === null ? 0 : ft8WfNoiseFloor;
+    const range = Math.max(1e-6, (ft8WfPeak === null ? 255 : ft8WfPeak) - floor);
     for (let x = 0; x < w; x++) {
-      let norm = (lineVals[x] - floor) / spanBytes;
+      let norm = (lineVals[x] - floor) / range;
       if (norm < 0) norm = 0; else if (norm > 1) norm = 1;
       const [r, g, b] = ft8WfColorForNorm(norm);
       ctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';

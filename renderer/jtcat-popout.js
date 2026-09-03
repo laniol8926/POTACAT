@@ -2092,7 +2092,7 @@ function _applyPopoutTheme(payload) {
         src.connect(analyser);
       }
 
-      multiWfPanes.push({ sliceId: cfg.sliceId, canvas: canvas, ctx: canvas.getContext('2d'), analyser: analyser, sampleRate: entry ? entry.ctx.sampleRate : 48000, txLine: txLine, txHz: txHz, noiseFloor: null });
+      multiWfPanes.push({ sliceId: cfg.sliceId, canvas: canvas, ctx: canvas.getContext('2d'), analyser: analyser, sampleRate: entry ? entry.ctx.sampleRate : 48000, txLine: txLine, txHz: txHz, noiseFloor: null, peak: null });
     });
 
     // Start waterfall animation loop
@@ -2110,22 +2110,25 @@ function _applyPopoutTheme(payload) {
         // AudioContext sample rate is typically 48kHz, so 3kHz = bins * (3000 / (sampleRate/2))
         var nyquist = (p.sampleRate || 48000) / 2;
         var useBins = Math.max(1, Math.floor(bins.length * 3000 / nyquist));
-        // Adaptive noise-floor coloring — same fix as popoutWaterfallLoop
-        // (see wfUpdateNoiseFloor/wfColorForNorm above) and ft8RenderWaterfall
-        // in renderer/remote.js, ported a third time here. Each pane tracks
-        // its own floor (p.noiseFloor) rather than sharing the single-pane
-        // wfNoiseFloor — different slices can sit on different bands with
-        // very different real noise levels.
+        // Adaptive floor+peak coloring — same fix as popoutWaterfallLoop
+        // (see wfUpdateFloorAndPeak/wfColorForNorm above) and
+        // ft8RenderWaterfall in renderer/remote.js, ported a third time
+        // here. Each pane tracks its own floor/peak rather than sharing the
+        // single-pane wfNoiseFloor/wfPeak — different slices can sit on
+        // different bands with very different real noise levels.
         var lineVals = new Float32Array(w);
         for (var x = 0; x < w; x++) lineVals[x] = bins[Math.floor(x * useBins / w)];
         var sorted = Array.prototype.slice.call(lineVals).sort(function (a, b) { return a - b; });
         var rawFloor = sorted[Math.floor(w * WF_AUTO_FLOOR_PERCENTILE)];
-        if (p.noiseFloor === null) p.noiseFloor = rawFloor;
-        else p.noiseFloor += (rawFloor - p.noiseFloor) * WF_AUTO_FLOOR_SMOOTHING;
-        var dbRange = (p.analyser.maxDecibels - p.analyser.minDecibels) || 70;
-        var spanBytes = WF_AUTO_DISPLAY_SPAN_DB * (255 / dbRange);
+        var hi = sorted[w - 1];
+        if (p.noiseFloor === null) { p.noiseFloor = rawFloor; p.peak = hi; }
+        else {
+          p.noiseFloor += (rawFloor - p.noiseFloor) * WF_AUTO_FLOOR_SMOOTHING;
+          p.peak = Math.max(p.peak * WF_AUTO_PEAK_DECAY + hi * WF_AUTO_PEAK_ATTACK, hi);
+        }
+        var range = Math.max(1e-6, p.peak - p.noiseFloor);
         for (var x = 0; x < w; x++) {
-          var norm = (lineVals[x] - p.noiseFloor) / spanBytes;
+          var norm = (lineVals[x] - p.noiseFloor) / range;
           if (norm < 0) norm = 0; else if (norm > 1) norm = 1;
           var rgb = wfColorForNorm(norm);
           p.ctx.fillStyle = 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
@@ -3791,17 +3794,40 @@ function _applyPopoutTheme(payload) {
   // conditions or the analyser's fixed dB range. Same approach as the
   // generic-rig-backend zbitxd fork's waterfall_color_for_v()/
   // update_noise_floor(), ported to AnalyserNode's byte-magnitude space.
+  // A FIXED dB span above the floor (the first cut of this fix) turned out
+  // wrong in practice: getByteFrequencyData()'s raw bins are single-frame
+  // periodogram values, which are inherently ragged bin-to-bin (classic
+  // FFT-of-noise raggedness — real, not a bug), so a single row's own
+  // noise ALONE can already span most of a modest fixed dB window. Result:
+  // ordinary noise painted across the whole ramp instead of staying dark
+  // (confirmed on real hardware — waterfall1.png, 2026-09-03). Switched to
+  // the same adaptive floor-AND-peak range renderer/waterfall.js already
+  // uses for SSTV (its pushFrame(), Waterfall class): floor slow-tracks a
+  // low percentile, peak fast-attacks/slow-decays the row's own max, and
+  // the color range is peak-floor — self-scaling to whatever this row's
+  // real dynamic range actually is instead of a guessed constant, so it
+  // can't blow out the same way.
   var wfNoiseFloor = null;
+  var wfPeak = null;
   var WF_AUTO_FLOOR_PERCENTILE = 0.10;
   var WF_AUTO_FLOOR_SMOOTHING = 0.05;
-  var WF_AUTO_DISPLAY_SPAN_DB = 25; // dB above the floor mapped to full-scale color
-  function wfUpdateNoiseFloor(vals) {
+  var WF_AUTO_PEAK_DECAY = 0.97;   // per-line retention — slow release
+  var WF_AUTO_PEAK_ATTACK = 0.03;  // per-line pull toward a higher peak
+  function wfUpdateFloorAndPeak(vals) {
     var n = vals.length;
     if (!n) return;
     var sorted = Array.prototype.slice.call(vals).sort(function (a, b) { return a - b; });
     var rawFloor = sorted[Math.floor(n * WF_AUTO_FLOOR_PERCENTILE)];
-    if (wfNoiseFloor === null) wfNoiseFloor = rawFloor;
-    else wfNoiseFloor += (rawFloor - wfNoiseFloor) * WF_AUTO_FLOOR_SMOOTHING;
+    var hi = sorted[n - 1];
+    if (wfNoiseFloor === null) { wfNoiseFloor = rawFloor; wfPeak = hi; }
+    else {
+      wfNoiseFloor += (rawFloor - wfNoiseFloor) * WF_AUTO_FLOOR_SMOOTHING;
+      // Fast attack (Math.max snaps up immediately to a new high), slow
+      // decay (drifts down 3%/line otherwise) — an envelope follower, so a
+      // burst of strong signals doesn't get instantly washed out the
+      // moment the very next line is quieter.
+      wfPeak = Math.max(wfPeak * WF_AUTO_PEAK_DECAY + hi * WF_AUTO_PEAK_ATTACK, hi);
+    }
   }
   // Maps a normalized 0-1 magnitude (already floor-subtracted and
   // span-scaled by the caller) to an RGB color. Same 5-band blue -> cyan ->
@@ -3905,14 +3931,13 @@ function _applyPopoutTheme(payload) {
           var binIdx = Math.floor(x * passbandBins / w);
           lineVals[x] = wfAccum[binIdx] * invCount;
         }
-        // Re-center the color ramp on THIS line's own noise floor before
-        // coloring it — see wfUpdateNoiseFloor above.
-        wfUpdateNoiseFloor(lineVals);
-        var dbRange = (popoutAnalyser.maxDecibels - popoutAnalyser.minDecibels) || 70;
-        var spanBytes = WF_AUTO_DISPLAY_SPAN_DB * (255 / dbRange);
+        // Re-center the color ramp on THIS line's own floor/peak before
+        // coloring it — see wfUpdateFloorAndPeak above.
+        wfUpdateFloorAndPeak(lineVals);
         var floor = wfNoiseFloor === null ? 0 : wfNoiseFloor;
+        var range = Math.max(1e-6, (wfPeak === null ? 255 : wfPeak) - floor);
         for (var x = 0; x < w; x++) {
-          var norm = (lineVals[x] - floor) / spanBytes;
+          var norm = (lineVals[x] - floor) / range;
           if (norm < 0) norm = 0; else if (norm > 1) norm = 1;
           var rgb = wfColorForNorm(norm);
           var i = x * 4;

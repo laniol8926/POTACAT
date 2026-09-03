@@ -10193,7 +10193,13 @@ function stopJtcatTune() {
 // so CPU is zero when nobody's looking. K3SBP 2026-05-31.
 const { computeSpectrumBins } = require('./lib/spectrum-fft');
 const SPECTRUM_INTERVAL_MS = 100;
-const SPECTRUM_BIN_COUNT = 160;
+// 320 (up from 160) roughly halves the blockiness of the ECHOCAT waterfall
+// (renderer/remote.js's ft8RenderWaterfall stretches these bins across a
+// much wider canvas) at a modest bandwidth cost — plain-JSON numbers,
+// ~doubling the per-frame payload at 10 fps is still a few KB/s, well
+// within what even a weak cellular link tolerates. Shared by every
+// ECHOCAT client uniformly; there's no per-client resolution negotiation.
+const SPECTRUM_BIN_COUNT = 320;
 let _spectrumTimer = null;
 // Sticky intent: the mobile FT8 waterfall panel is open and wants the feed.
 // It is the source of truth for resuming the loop on reconnect — recovery no
